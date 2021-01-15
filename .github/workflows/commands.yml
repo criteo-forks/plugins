@@ -5,7 +5,7 @@ on:
 
 jobs:
   retest:
-    if: github.repository == 'containernetworking/plugins'
+    if: github.repository == 'criteo-forks/cni-plugins'
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
