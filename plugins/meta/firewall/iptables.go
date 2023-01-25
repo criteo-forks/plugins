@@ -27,7 +27,7 @@ import (
 
 func getPrivChainRules(ip string) [][]string {
 	var rules [][]string
-	rules = append(rules, []string{"-d", ip, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"})
+	rules = append(rules, []string{"-d", ip, "-j", "ACCEPT"})
 	rules = append(rules, []string{"-s", ip, "-j", "ACCEPT"})
 	return rules
 }

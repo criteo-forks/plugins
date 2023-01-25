@@ -66,7 +66,7 @@ func findForwardAllowRules(rules []string, ip string) (bool, bool) {
 		}
 		if strings.Contains(rule, fmt.Sprintf(" -s %s ", ip)) {
 			foundOne = true
-		} else if strings.Contains(rule, fmt.Sprintf(" -d %s ", ip)) && strings.Contains(rule, "RELATED,ESTABLISHED") {
+		} else if strings.Contains(rule, fmt.Sprintf(" -d %s ", ip)) {
 			foundTwo = true
 		}
 	}
