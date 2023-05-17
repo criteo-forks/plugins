@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [master]
 env:
-  GO_VERSION: "1.15"
+  GO_VERSION: "1.20"
   LINUX_ARCH: "amd64"
 
 jobs:
