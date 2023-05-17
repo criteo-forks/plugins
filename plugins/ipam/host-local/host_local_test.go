@@ -304,7 +304,8 @@ var _ = Describe("host-local Operations", func() {
 				return cmdAdd(args)
 			})
 			Expect(err).NotTo(HaveOccurred())
-			if testutils.SpecVersionHasIPVersion(ver) {
+			hasIPVersion := testutils.SpecVersionHasIPVersion(ver)
+			if hasIPVersion {
 				Expect(strings.Index(string(raw), "\"version\":")).Should(BeNumerically(">", 0))
 			}
 
@@ -318,7 +319,9 @@ var _ = Describe("host-local Operations", func() {
 				return cmdAdd(args)
 			})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(strings.Index(string(raw), "\"version\":")).Should(BeNumerically(">", 0))
+			if hasIPVersion {
+				Expect(strings.Index(string(raw), "\"version\":")).Should(BeNumerically(">", 0))
+			}
 
 			result1, err := types100.GetResult(r1)
 			Expect(err).NotTo(HaveOccurred())
@@ -330,7 +333,9 @@ var _ = Describe("host-local Operations", func() {
 				return cmdAdd(args1)
 			})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(strings.Index(string(raw), "\"version\":")).Should(BeNumerically(">", 0))
+			if hasIPVersion {
+				Expect(strings.Index(string(raw), "\"version\":")).Should(BeNumerically(">", 0))
+			}
 
 			result2, err := types100.GetResult(r2)
 			Expect(err).NotTo(HaveOccurred())
@@ -342,7 +347,9 @@ var _ = Describe("host-local Operations", func() {
 				return cmdAdd(args)
 			})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(strings.Index(string(raw), "\"version\":")).Should(BeNumerically(">", 0))
+			if hasIPVersion {
+				Expect(strings.Index(string(raw), "\"version\":")).Should(BeNumerically(">", 0))
+			}
 
 			result3, err := types100.GetResult(r3)
 			Expect(err).NotTo(HaveOccurred())
