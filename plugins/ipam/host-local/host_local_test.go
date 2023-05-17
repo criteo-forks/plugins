@@ -322,7 +322,7 @@ var _ = Describe("host-local Operations", func() {
 
 			result1, err := types100.GetResult(r1)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(len(result1.IPs)).Should(Equal(1))
+			Expect(result1.IPs).Should(HaveLen(1))
 			Expect(result1.IPs[0].Address.String()).Should(Equal("10.1.2.2/24"))
 
 			// Allocate the IP with the another container ID
@@ -334,7 +334,7 @@ var _ = Describe("host-local Operations", func() {
 
 			result2, err := types100.GetResult(r2)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(len(result2.IPs)).Should(Equal(1))
+			Expect(result2.IPs).Should(HaveLen(1))
 			Expect(result2.IPs[0].Address.String()).Should(Equal("10.1.2.3/24"))
 
 			// Allocate the IP with the same container ID again
@@ -346,7 +346,7 @@ var _ = Describe("host-local Operations", func() {
 
 			result3, err := types100.GetResult(r3)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(len(result3.IPs)).Should(Equal(1))
+			Expect(result3.IPs).Should(HaveLen(1))
 			Expect(result3.IPs[0].Address.String()).Should(Equal("10.1.2.2/24"))
 
 			ipFilePath := filepath.Join(tmpDir, "mynet0", "10.1.2.2")
