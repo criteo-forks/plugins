@@ -31,12 +31,12 @@ import (
 	"log"
 	"net"
 
-	"github.com/containernetworking/cni/pkg/skel"
-	"github.com/containernetworking/cni/pkg/types"
-	"github.com/containernetworking/cni/pkg/types/current"
-	"github.com/containernetworking/cni/pkg/version"
 	"golang.org/x/sys/unix"
 
+	"github.com/containernetworking/cni/pkg/skel"
+	"github.com/containernetworking/cni/pkg/types"
+	current "github.com/containernetworking/cni/pkg/types/100"
+	"github.com/containernetworking/cni/pkg/version"
 	bv "github.com/containernetworking/plugins/pkg/utils/buildversion"
 )
 
@@ -54,6 +54,7 @@ type PortMapConf struct {
 	SNAT                 *bool     `json:"snat,omitempty"`
 	ConditionsV4         *[]string `json:"conditionsV4"`
 	ConditionsV6         *[]string `json:"conditionsV6"`
+	MasqAll              bool      `json:"masqAll,omitempty"`
 	MarkMasqBit          *int      `json:"markMasqBit"`
 	ExternalSetMarkChain *string   `json:"externalSetMarkChain"`
 	RuntimeConfig        struct {
@@ -129,10 +130,7 @@ func cmdDel(args *skel.CmdArgs) error {
 
 	// We don't need to parse out whether or not we're using v6 or snat,
 	// deletion is idempotent
-	if err := unforwardPorts(netConf); err != nil {
-		return err
-	}
-	return nil
+	return unforwardPorts(netConf)
 }
 
 func main() {
@@ -223,9 +221,10 @@ func parseConfig(stdin []byte, ifName string) (*PortMapConf, *current.Result, er
 
 	if conf.PrevResult != nil {
 		for _, ip := range result.IPs {
-			if ip.Version == "6" && conf.ContIPv6.IP != nil {
+			isIPv4 := ip.Address.IP.To4() != nil
+			if !isIPv4 && conf.ContIPv6.IP != nil {
 				continue
-			} else if ip.Version == "4" && conf.ContIPv4.IP != nil {
+			} else if isIPv4 && conf.ContIPv4.IP != nil {
 				continue
 			}
 
@@ -239,11 +238,10 @@ func parseConfig(stdin []byte, ifName string) (*PortMapConf, *current.Result, er
 					continue
 				}
 			}
-			switch ip.Version {
-			case "6":
-				conf.ContIPv6 = ip.Address
-			case "4":
+			if ip.Address.IP.To4() != nil {
 				conf.ContIPv4 = ip.Address
+			} else {
+				conf.ContIPv6 = ip.Address
 			}
 		}
 	}

@@ -19,15 +19,16 @@ import (
 	"net"
 	"os"
 
-	"github.com/containernetworking/cni/pkg/types/current"
+	"github.com/vishvananda/netlink"
+
+	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/containernetworking/plugins/pkg/utils/sysctl"
-
-	"github.com/vishvananda/netlink"
 )
 
 const (
-	DisableIPv6SysctlTemplate = "net.ipv6.conf.%s.disable_ipv6"
+	// Note: use slash as separator so we can have dots in interface name (VLANs)
+	DisableIPv6SysctlTemplate = "net/ipv6/conf/%s/disable_ipv6"
 )
 
 // ConfigureIface takes the result of IPAM plugin and
@@ -42,12 +43,8 @@ func ConfigureIface(ifName string, res *current.Result) error {
 		return fmt.Errorf("failed to lookup %q: %v", ifName, err)
 	}
 
-	if err := netlink.LinkSetUp(link); err != nil {
-		return fmt.Errorf("failed to set %q UP: %v", ifName, err)
-	}
-
 	var v4gw, v6gw net.IP
-	var has_enabled_ipv6 bool = false
+	hasEnabledIpv6 := false
 	for _, ipc := range res.IPs {
 		if ipc.Interface == nil {
 			continue
@@ -60,7 +57,7 @@ func ConfigureIface(ifName string, res *current.Result) error {
 
 		// Make sure sysctl "disable_ipv6" is 0 if we are about to add
 		// an IPv6 address to the interface
-		if !has_enabled_ipv6 && ipc.Version == "6" {
+		if !hasEnabledIpv6 && ipc.Address.IP.To4() == nil {
 			// Enabled IPv6 for loopback "lo" and the interface
 			// being configured
 			for _, iface := range [2]string{"lo", ifName} {
@@ -68,8 +65,11 @@ func ConfigureIface(ifName string, res *current.Result) error {
 
 				// Read current sysctl value
 				value, err := sysctl.Sysctl(ipv6SysctlValueName)
-				if err != nil || value == "0" {
-					// FIXME: log warning if unable to read sysctl value
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "ipam_linux: failed to read sysctl %q: %v\n", ipv6SysctlValueName, err)
+					continue
+				}
+				if value == "0" {
 					continue
 				}
 
@@ -79,7 +79,7 @@ func ConfigureIface(ifName string, res *current.Result) error {
 					return fmt.Errorf("failed to enable IPv6 for interface %q (%s=%s): %v", iface, ipv6SysctlValueName, value, err)
 				}
 			}
-			has_enabled_ipv6 = true
+			hasEnabledIpv6 = true
 		}
 
 		addr := &netlink.Addr{IPNet: &ipc.Address, Label: ""}
@@ -93,6 +93,10 @@ func ConfigureIface(ifName string, res *current.Result) error {
 		} else if !gwIsV4 && v6gw == nil {
 			v6gw = ipc.Gateway
 		}
+	}
+
+	if err := netlink.LinkSetUp(link); err != nil {
+		return fmt.Errorf("failed to set %q UP: %v", ifName, err)
 	}
 
 	if v6gw != nil {
@@ -109,11 +113,14 @@ func ConfigureIface(ifName string, res *current.Result) error {
 				gw = v6gw
 			}
 		}
-		if err = ip.AddRoute(&r.Dst, gw, link); err != nil {
-			// we skip over duplicate routes as we assume the first one wins
-			if !os.IsExist(err) {
-				return fmt.Errorf("failed to add route '%v via %v dev %v': %v", r.Dst, gw, ifName, err)
-			}
+		route := netlink.Route{
+			Dst:       &r.Dst,
+			LinkIndex: link.Attrs().Index,
+			Gw:        gw,
+		}
+
+		if err = netlink.RouteAddEcmp(&route); err != nil {
+			return fmt.Errorf("failed to add route '%v via %v dev %v': %v", r.Dst, gw, ifName, err)
 		}
 	}
 

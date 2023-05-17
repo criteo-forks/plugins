@@ -20,21 +20,14 @@ import (
 	"fmt"
 	"net"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/vishvananda/netlink"
 
 	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/containernetworking/plugins/pkg/testutils"
-
-	"github.com/vishvananda/netlink"
 )
-
-func getHwAddr(linkname string) string {
-	veth, err := netlink.LinkByName(linkname)
-	Expect(err).NotTo(HaveOccurred())
-	return fmt.Sprintf("%s", veth.Attrs().HardwareAddr)
-}
 
 var _ = Describe("Link", func() {
 	const (
@@ -51,8 +44,6 @@ var _ = Describe("Link", func() {
 		hostVethName      string
 		containerVethName string
 
-		ip4one             = net.ParseIP("1.1.1.1")
-		ip4two             = net.ParseIP("1.1.1.2")
 		originalRandReader = rand.Reader
 	)
 
@@ -66,13 +57,13 @@ var _ = Describe("Link", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		fakeBytes := make([]byte, 20)
-		//to be reset in AfterEach block
+		// to be reset in AfterEach block
 		rand.Reader = bytes.NewReader(fakeBytes)
 
 		_ = containerNetNS.Do(func(ns.NetNS) error {
 			defer GinkgoRecover()
 
-			hostVeth, containerVeth, err = ip.SetupVeth(fmt.Sprintf(ifaceFormatString, ifaceCounter), mtu, hostNetNS)
+			hostVeth, containerVeth, err = ip.SetupVeth(fmt.Sprintf(ifaceFormatString, ifaceCounter), mtu, "", hostNetNS)
 			if err != nil {
 				return err
 			}
@@ -159,7 +150,7 @@ var _ = Describe("Link", func() {
 			_ = containerNetNS.Do(func(ns.NetNS) error {
 				defer GinkgoRecover()
 
-				_, _, err := ip.SetupVeth(containerVethName, mtu, hostNetNS)
+				_, _, err := ip.SetupVeth(containerVethName, mtu, "", hostNetNS)
 				Expect(err.Error()).To(Equal(fmt.Sprintf("container veth name provided (%s) already exists", containerVethName)))
 
 				return nil
@@ -183,15 +174,15 @@ var _ = Describe("Link", func() {
 
 	Context("when there is no name available for the host-side", func() {
 		BeforeEach(func() {
-			//adding different interface to container ns
+			// adding different interface to container ns
 			containerVethName += "0"
 		})
 		It("returns useful error", func() {
 			_ = containerNetNS.Do(func(ns.NetNS) error {
 				defer GinkgoRecover()
-				_, _, err := ip.SetupVeth(containerVethName, mtu, hostNetNS)
-				Expect(err.Error()).To(HavePrefix("failed to move veth to host netns: "))
-
+				_, _, err := ip.SetupVeth(containerVethName, mtu, "", hostNetNS)
+				Expect(err.Error()).To(HavePrefix("container veth name provided"))
+				Expect(err.Error()).To(HaveSuffix("already exists"))
 				return nil
 			})
 		})
@@ -199,7 +190,7 @@ var _ = Describe("Link", func() {
 
 	Context("when there is no name conflict for the host or container interfaces", func() {
 		BeforeEach(func() {
-			//adding different interface to container and host ns
+			// adding different interface to container and host ns
 			containerVethName += "0"
 			rand.Reader = originalRandReader
 		})
@@ -207,13 +198,13 @@ var _ = Describe("Link", func() {
 			_ = containerNetNS.Do(func(ns.NetNS) error {
 				defer GinkgoRecover()
 
-				hostVeth, _, err := ip.SetupVeth(containerVethName, mtu, hostNetNS)
+				hostVeth, _, err := ip.SetupVeth(containerVethName, mtu, "", hostNetNS)
 				Expect(err).NotTo(HaveOccurred())
 				hostVethName = hostVeth.Name
 				return nil
 			})
 
-			//verify veths are in different namespaces
+			// verify veths are in different namespaces
 			_ = containerNetNS.Do(func(ns.NetNS) error {
 				defer GinkgoRecover()
 
@@ -233,6 +224,32 @@ var _ = Describe("Link", func() {
 			})
 		})
 
+		It("successfully creates a veth pair with an explicit mac", func() {
+			const mac = "02:00:00:00:01:23"
+			_ = containerNetNS.Do(func(ns.NetNS) error {
+				defer GinkgoRecover()
+
+				hostVeth, _, err := ip.SetupVeth(containerVethName, mtu, mac, hostNetNS)
+				Expect(err).NotTo(HaveOccurred())
+				hostVethName = hostVeth.Name
+
+				link, err := netlink.LinkByName(containerVethName)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(link.Attrs().HardwareAddr.String()).To(Equal(mac))
+
+				return nil
+			})
+
+			_ = hostNetNS.Do(func(ns.NetNS) error {
+				defer GinkgoRecover()
+
+				link, err := netlink.LinkByName(hostVethName)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(link.Attrs().HardwareAddr.String()).NotTo(Equal(mac))
+
+				return nil
+			})
+		})
 	})
 
 	It("DelLinkByName must delete the veth endpoints", func() {
@@ -266,44 +283,7 @@ var _ = Describe("Link", func() {
 			// this will delete the host endpoint too
 			addr, err := ip.DelLinkByNameAddr(containerVethName)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(addr).To(HaveLen(0))
-			return nil
-		})
-	})
-
-	It("SetHWAddrByIP must change the interface hwaddr and be predictable", func() {
-
-		_ = containerNetNS.Do(func(ns.NetNS) error {
-			defer GinkgoRecover()
-
-			var err error
-			hwaddrBefore := getHwAddr(containerVethName)
-
-			err = ip.SetHWAddrByIP(containerVethName, ip4one, nil)
-			Expect(err).NotTo(HaveOccurred())
-			hwaddrAfter1 := getHwAddr(containerVethName)
-
-			Expect(hwaddrBefore).NotTo(Equal(hwaddrAfter1))
-			Expect(hwaddrAfter1).To(Equal(ip4onehwaddr))
-
-			return nil
-		})
-	})
-
-	It("SetHWAddrByIP must be injective", func() {
-
-		_ = containerNetNS.Do(func(ns.NetNS) error {
-			defer GinkgoRecover()
-
-			err := ip.SetHWAddrByIP(containerVethName, ip4one, nil)
-			Expect(err).NotTo(HaveOccurred())
-			hwaddrAfter1 := getHwAddr(containerVethName)
-
-			err = ip.SetHWAddrByIP(containerVethName, ip4two, nil)
-			Expect(err).NotTo(HaveOccurred())
-			hwaddrAfter2 := getHwAddr(containerVethName)
-
-			Expect(hwaddrAfter1).NotTo(Equal(hwaddrAfter2))
+			Expect(addr).To(BeEmpty())
 			return nil
 		})
 	})

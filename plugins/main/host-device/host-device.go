@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -30,24 +29,25 @@ import (
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
-	"github.com/containernetworking/cni/pkg/types/current"
+	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
-
 	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/containernetworking/plugins/pkg/ns"
 	bv "github.com/containernetworking/plugins/pkg/utils/buildversion"
 )
 
-const (
-	sysBusPCI = "/sys/bus/pci/devices"
-)
+var sysBusPCI = "/sys/bus/pci/devices"
 
-//NetConf for host-device config, look the README to learn how to use those parameters
+// Array of different linux drivers bound to network device needed for DPDK
+var userspaceDrivers = []string{"vfio-pci", "uio_pci_generic", "igb_uio"}
+
+// NetConf for host-device config, look the README to learn how to use those parameters
 type NetConf struct {
 	types.NetConf
-	Device        string `json:"device"`     // Device-Name, something like eth0 or can0 etc.
-	HWAddr        string `json:"hwaddr"`     // MAC Address of target network interface
+	Device        string `json:"device"` // Device-Name, something like eth0 or can0 etc.
+	HWAddr        string `json:"hwaddr"` // MAC Address of target network interface
+	DPDKMode      bool
 	KernelPath    string `json:"kernelpath"` // Kernelpath of the device
 	PCIAddr       string `json:"pciBusID"`   // PCI Address of target network device
 	RuntimeConfig struct {
@@ -64,7 +64,8 @@ func init() {
 
 func loadConf(bytes []byte) (*NetConf, error) {
 	n := &NetConf{}
-	if err := json.Unmarshal(bytes, n); err != nil {
+	var err error
+	if err = json.Unmarshal(bytes, n); err != nil {
 		return nil, fmt.Errorf("failed to load netconf: %v", err)
 	}
 
@@ -75,6 +76,13 @@ func loadConf(bytes []byte) (*NetConf, error) {
 
 	if n.Device == "" && n.HWAddr == "" && n.KernelPath == "" && n.PCIAddr == "" {
 		return nil, fmt.Errorf(`specify either "device", "hwaddr", "kernelpath" or "pciBusID"`)
+	}
+
+	if len(n.PCIAddr) > 0 {
+		n.DPDKMode, err = hasDpdkDriver(n.PCIAddr)
+		if err != nil {
+			return nil, fmt.Errorf("error with host device: %v", err)
+		}
 	}
 
 	return n, nil
@@ -91,39 +99,17 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 	defer containerNs.Close()
 
-	hostDev, err := getLink(cfg.Device, cfg.HWAddr, cfg.KernelPath, cfg.PCIAddr)
-	if err != nil {
-		return fmt.Errorf("failed to find host device: %v", err)
-	}
-
-	contDev, err := moveLinkIn(hostDev, containerNs, args.IfName)
-	if err != nil {
-		return fmt.Errorf("failed to move link %v", err)
-	}
-
-	var result *current.Result
-	// run the IPAM plugin and get back the config to apply
-	if cfg.IPAM.Type != "" {
-		r, err := ipam.ExecAdd(cfg.IPAM.Type, args.StdinData)
+	result := &current.Result{}
+	var contDev netlink.Link
+	if !cfg.DPDKMode {
+		hostDev, err := getLink(cfg.Device, cfg.HWAddr, cfg.KernelPath, cfg.PCIAddr)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to find host device: %v", err)
 		}
 
-		// Invoke ipam del if err to avoid ip leak
-		defer func() {
-			if err != nil {
-				ipam.ExecDel(cfg.IPAM.Type, args.StdinData)
-			}
-		}()
-
-		// Convert whatever the IPAM result was into the current Result type
-		result, err = current.NewResultFromResult(r)
+		contDev, err = moveLinkIn(hostDev, containerNs, args.IfName)
 		if err != nil {
-			return err
-		}
-
-		if len(result.IPs) == 0 {
-			return errors.New("IPAM plugin returned missing IP config")
+			return fmt.Errorf("failed to move link %v", err)
 		}
 
 		result.Interfaces = []*current.Interface{{
@@ -131,27 +117,57 @@ func cmdAdd(args *skel.CmdArgs) error {
 			Mac:     contDev.Attrs().HardwareAddr.String(),
 			Sandbox: containerNs.Path(),
 		}}
-		for _, ipc := range result.IPs {
-			// All addresses apply to the container interface (move from host)
-			ipc.Interface = current.Int(0)
-		}
+	}
 
+	if cfg.IPAM.Type == "" {
+		if cfg.DPDKMode {
+			return types.PrintResult(result, cfg.CNIVersion)
+		}
+		return printLink(contDev, cfg.CNIVersion, containerNs)
+	}
+
+	// run the IPAM plugin and get back the config to apply
+	r, err := ipam.ExecAdd(cfg.IPAM.Type, args.StdinData)
+	if err != nil {
+		return err
+	}
+
+	// Invoke ipam del if err to avoid ip leak
+	defer func() {
+		if err != nil {
+			ipam.ExecDel(cfg.IPAM.Type, args.StdinData)
+		}
+	}()
+
+	// Convert whatever the IPAM result was into the current Result type
+	newResult, err := current.NewResultFromResult(r)
+	if err != nil {
+		return err
+	}
+
+	if len(newResult.IPs) == 0 {
+		return errors.New("IPAM plugin returned missing IP config")
+	}
+
+	for _, ipc := range newResult.IPs {
+		// All addresses apply to the container interface (move from host)
+		ipc.Interface = current.Int(0)
+	}
+
+	newResult.Interfaces = result.Interfaces
+
+	if !cfg.DPDKMode {
 		err = containerNs.Do(func(_ ns.NetNS) error {
-			if err := ipam.ConfigureIface(args.IfName, result); err != nil {
-				return err
-			}
-			return nil
+			return ipam.ConfigureIface(args.IfName, newResult)
 		})
 		if err != nil {
 			return err
 		}
-
-		result.DNS = cfg.DNS
-
-		return types.PrintResult(result, cfg.CNIVersion)
 	}
 
-	return printLink(contDev, cfg.CNIVersion, containerNs)
+	newResult.DNS = cfg.DNS
+
+	return types.PrintResult(newResult, cfg.CNIVersion)
 }
 
 func cmdDel(args *skel.CmdArgs) error {
@@ -168,12 +184,14 @@ func cmdDel(args *skel.CmdArgs) error {
 	}
 	defer containerNs.Close()
 
-	if err := moveLinkOut(containerNs, args.IfName); err != nil {
-		return err
-	}
-
 	if cfg.IPAM.Type != "" {
 		if err := ipam.ExecDel(cfg.IPAM.Type, args.StdinData); err != nil {
+			return err
+		}
+	}
+
+	if !cfg.DPDKMode {
+		if err := moveLinkOut(containerNs, args.IfName); err != nil {
 			return err
 		}
 	}
@@ -204,6 +222,10 @@ func moveLinkIn(hostDev netlink.Link, containerNs ns.NetNS, ifName string) (netl
 		// Rename container device to respect args.IfName
 		if err := netlink.LinkSetName(contDev, ifName); err != nil {
 			return fmt.Errorf("failed to rename device %q to %q: %v", hostDev.Attrs().Name, ifName, err)
+		}
+		// Bring container device up
+		if err = netlink.LinkSetUp(contDev); err != nil {
+			return fmt.Errorf("failed to set %q up: %v", ifName, err)
 		}
 		// Retrieve link again to get up-to-date name and attributes
 		contDev, err = netlink.LinkByName(ifName)
@@ -236,23 +258,46 @@ func moveLinkOut(containerNs ns.NetNS, ifName string) error {
 			return fmt.Errorf("failed to set %q down: %v", ifName, err)
 		}
 
-		// Rename device to it's original name
+		defer func() {
+			// If moving the device to the host namespace fails, set its name back to ifName so that this
+			// function can be retried. Also bring the device back up, unless it was already down before.
+			if err != nil {
+				_ = netlink.LinkSetName(dev, ifName)
+				if dev.Attrs().Flags&net.FlagUp == net.FlagUp {
+					_ = netlink.LinkSetUp(dev)
+				}
+			}
+		}()
+
+		// Rename the device to its original name from the host namespace
 		if err = netlink.LinkSetName(dev, dev.Attrs().Alias); err != nil {
 			return fmt.Errorf("failed to restore %q to original name %q: %v", ifName, dev.Attrs().Alias, err)
 		}
-		defer func() {
-			if err != nil {
-				// if moving device to host namespace fails, we should revert device name
-				// to ifName to make sure that device can be found in retries
-				_ = netlink.LinkSetName(dev, ifName)
-			}
-		}()
 
 		if err = netlink.LinkSetNsFd(dev, int(defaultNs.Fd())); err != nil {
 			return fmt.Errorf("failed to move %q to host netns: %v", dev.Attrs().Alias, err)
 		}
 		return nil
 	})
+}
+
+func hasDpdkDriver(pciaddr string) (bool, error) {
+	driverLink := filepath.Join(sysBusPCI, pciaddr, "driver")
+	driverPath, err := filepath.EvalSymlinks(driverLink)
+	if err != nil {
+		return false, err
+	}
+	driverStat, err := os.Stat(driverPath)
+	if err != nil {
+		return false, err
+	}
+	driverName := driverStat.Name()
+	for _, drv := range userspaceDrivers {
+		if driverName == drv {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func printLink(dev netlink.Link, cniVersion string, containerNs ns.NetNS) error {
@@ -274,10 +319,11 @@ func getLink(devname, hwaddr, kernelpath, pciaddr string) (netlink.Link, error) 
 	if err != nil {
 		return nil, fmt.Errorf("failed to list node links: %v", err)
 	}
+	switch {
 
-	if len(devname) > 0 {
+	case len(devname) > 0:
 		return netlink.LinkByName(devname)
-	} else if len(hwaddr) > 0 {
+	case len(hwaddr) > 0:
 		hwAddr, err := net.ParseMAC(hwaddr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse MAC address %q: %v", hwaddr, err)
@@ -288,26 +334,26 @@ func getLink(devname, hwaddr, kernelpath, pciaddr string) (netlink.Link, error) 
 				return link, nil
 			}
 		}
-	} else if len(kernelpath) > 0 {
+	case len(kernelpath) > 0:
 		if !filepath.IsAbs(kernelpath) || !strings.HasPrefix(kernelpath, "/sys/devices/") {
 			return nil, fmt.Errorf("kernel device path %q must be absolute and begin with /sys/devices/", kernelpath)
 		}
 		netDir := filepath.Join(kernelpath, "net")
-		files, err := ioutil.ReadDir(netDir)
+		entries, err := os.ReadDir(netDir)
 		if err != nil {
 			return nil, fmt.Errorf("failed to find network devices at %q", netDir)
 		}
 
 		// Grab the first device from eg /sys/devices/pci0000:00/0000:00:19.0/net
-		for _, file := range files {
+		for _, entry := range entries {
 			// Make sure it's really an interface
 			for _, l := range links {
-				if file.Name() == l.Attrs().Name {
+				if entry.Name() == l.Attrs().Name {
 					return l, nil
 				}
 			}
 		}
-	} else if len(pciaddr) > 0 {
+	case len(pciaddr) > 0:
 		netDir := filepath.Join(sysBusPCI, pciaddr, "net")
 		if _, err := os.Lstat(netDir); err != nil {
 			virtioNetDir := filepath.Join(sysBusPCI, pciaddr, "virtio*", "net")
@@ -317,12 +363,12 @@ func getLink(devname, hwaddr, kernelpath, pciaddr string) (netlink.Link, error) 
 			}
 			netDir = matches[0]
 		}
-		fInfo, err := ioutil.ReadDir(netDir)
+		entries, err := os.ReadDir(netDir)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read net directory %s: %q", netDir, err)
 		}
-		if len(fInfo) > 0 {
-			return netlink.LinkByName(fInfo[0].Name())
+		if len(entries) > 0 {
+			return netlink.LinkByName(entries[0].Name())
 		}
 		return nil, fmt.Errorf("failed to find device name for pci address %s", pciaddr)
 	}
@@ -335,7 +381,6 @@ func main() {
 }
 
 func cmdCheck(args *skel.CmdArgs) error {
-
 	cfg, err := loadConf(args.StdinData)
 	if err != nil {
 		return err
@@ -368,6 +413,10 @@ func cmdCheck(args *skel.CmdArgs) error {
 		return err
 	}
 
+	if cfg.DPDKMode {
+		return nil
+	}
+
 	var contMap current.Interface
 	// Find interfaces for name we know, that of host-device inside container
 	for _, intf := range result.Interfaces {
@@ -388,7 +437,6 @@ func cmdCheck(args *skel.CmdArgs) error {
 	//
 	// Check prevResults for ips, routes and dns against values found in the container
 	if err := netns.Do(func(_ ns.NetNS) error {
-
 		// Check interface against values found in the container
 		err := validateCniContainerInterface(contMap)
 		if err != nil {
@@ -414,7 +462,6 @@ func cmdCheck(args *skel.CmdArgs) error {
 }
 
 func validateCniContainerInterface(intf current.Interface) error {
-
 	var link netlink.Link
 	var err error
 

@@ -26,9 +26,8 @@ import (
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
-	"github.com/containernetworking/cni/pkg/types/current"
+	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
-
 	"github.com/containernetworking/plugins/pkg/ns"
 	bv "github.com/containernetworking/plugins/pkg/utils/buildversion"
 )
@@ -109,7 +108,6 @@ func parseConfig(stdin []byte) (*PluginConf, error) {
 
 // getIPCfgs finds the IPs on the supplied interface, returning as IPConfig structures
 func getIPCfgs(iface string, prevResult *current.Result) ([]*current.IPConfig, error) {
-
 	if len(prevResult.IPs) == 0 {
 		// No IP addresses; that makes no sense. Pack it in.
 		return nil, fmt.Errorf("No IP addresses supplied on interface: %s", iface)
@@ -166,7 +164,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 	// Do the actual work.
 	err = withLockAndNetNS(args.Netns, func(_ ns.NetNS) error {
-		return doRoutes(ipCfgs, conf.PrevResult.Routes, args.IfName)
+		return doRoutes(ipCfgs, args.IfName)
 	})
 	if err != nil {
 		return err
@@ -176,23 +174,9 @@ func cmdAdd(args *skel.CmdArgs) error {
 	return types.PrintResult(conf.PrevResult, conf.CNIVersion)
 }
 
-// doRoutes does all the work to set up routes and rules during an add.
-func doRoutes(ipCfgs []*current.IPConfig, origRoutes []*types.Route, iface string) error {
-	// Get a list of rules and routes ready.
-	rules, err := netlink.RuleList(netlink.FAMILY_ALL)
-	if err != nil {
-		return fmt.Errorf("Failed to list all rules: %v", err)
-	}
-
-	routes, err := netlink.RouteList(nil, netlink.FAMILY_ALL)
-	if err != nil {
-		return fmt.Errorf("Failed to list all routes: %v", err)
-	}
-
-	// Pick a table ID to use. We pick the first table ID from firstTableID
-	// on that has no existing rules mapping to it and no existing routes in
-	// it.
-	table := firstTableID
+// getNextTableID picks the first free table id from a giveen candidate id
+func getNextTableID(rules []netlink.Rule, routes []netlink.Route, candidateID int) int {
+	table := candidateID
 	for {
 		foundExisting := false
 		for _, rule := range rules {
@@ -215,7 +199,26 @@ func doRoutes(ipCfgs []*current.IPConfig, origRoutes []*types.Route, iface strin
 			break
 		}
 	}
+	return table
+}
 
+// doRoutes does all the work to set up routes and rules during an add.
+func doRoutes(ipCfgs []*current.IPConfig, iface string) error {
+	// Get a list of rules and routes ready.
+	rules, err := netlink.RuleList(netlink.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("Failed to list all rules: %v", err)
+	}
+
+	routes, err := netlink.RouteList(nil, netlink.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("Failed to list all routes: %v", err)
+	}
+
+	// Pick a table ID to use. We pick the first table ID from firstTableID
+	// on that has no existing rules mapping to it and no existing routes in
+	// it.
+	table := getNextTableID(rules, routes, firstTableID)
 	log.Printf("First unreferenced table: %d", table)
 
 	link, err := netlink.LinkByName(iface)
@@ -224,6 +227,12 @@ func doRoutes(ipCfgs []*current.IPConfig, origRoutes []*types.Route, iface strin
 	}
 
 	linkIndex := link.Attrs().Index
+
+	// Get all routes for the interface in the default routing table
+	routes, err = netlink.RouteList(link, netlink.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("Unable to list routes: %v", err)
+	}
 
 	// Loop through setting up source based rules and default routes.
 	for _, ipCfg := range ipCfgs {
@@ -234,7 +243,7 @@ func doRoutes(ipCfgs []*current.IPConfig, origRoutes []*types.Route, iface strin
 		// Source must be restricted to a single IP, not a full subnet
 		var src net.IPNet
 		src.IP = ipCfg.Address.IP
-		if ipCfg.Version == "4" {
+		if src.IP.To4() != nil {
 			src.Mask = net.CIDRMask(32, 32)
 		} else {
 			src.Mask = net.CIDRMask(128, 128)
@@ -253,7 +262,7 @@ func doRoutes(ipCfgs []*current.IPConfig, origRoutes []*types.Route, iface strin
 			log.Printf("Adding default route to gateway %s", ipCfg.Gateway.String())
 
 			var dest net.IPNet
-			if ipCfg.Version == "4" {
+			if ipCfg.Address.IP.To4() != nil {
 				dest.IP = net.IPv4zero
 				dest.Mask = net.CIDRMask(0, 32)
 			} else {
@@ -265,7 +274,8 @@ func doRoutes(ipCfgs []*current.IPConfig, origRoutes []*types.Route, iface strin
 				Dst:       &dest,
 				Gw:        ipCfg.Gateway,
 				Table:     table,
-				LinkIndex: linkIndex}
+				LinkIndex: linkIndex,
+			}
 
 			err = netlink.RouteAdd(&route)
 			if err != nil {
@@ -274,37 +284,47 @@ func doRoutes(ipCfgs []*current.IPConfig, origRoutes []*types.Route, iface strin
 					err)
 			}
 		}
+
+		// Copy the previously added routes for the interface to the correct
+		// table; all the routes have been added to the interface anyway but
+		// in the wrong table, so instead of removing them we just move them
+		// to the table we want them in.
+		for _, r := range routes {
+			if ipCfg.Address.Contains(r.Src) || ipCfg.Address.Contains(r.Gw) ||
+				(r.Src == nil && r.Gw == nil) {
+				// (r.Src == nil && r.Gw == nil) is inferred as a generic route
+				log.Printf("Copying route %s from table %d to %d",
+					r.String(), r.Table, table)
+
+				r.Table = table
+
+				// Reset the route flags since if it is dynamically created,
+				// adding it to the new table will fail with "invalid argument"
+				r.Flags = 0
+
+				// We use route replace in case the route already exists, which
+				// is possible for the default gateway we added above.
+				err = netlink.RouteReplace(&r)
+				if err != nil {
+					return fmt.Errorf("Failed to readd route: %v", err)
+				}
+			}
+		}
+
+		// Use a different table for each ipCfg
+		table++
+		table = getNextTableID(rules, routes, table)
 	}
 
-	// Move all routes into the correct table. We are taking a shortcut; all
-	// the routes have been added to the interface anyway but in the wrong
-	// table, so instead of removing them we just move them to the table we
-	// want them in.
-	routes, err = netlink.RouteList(link, netlink.FAMILY_ALL)
-	if err != nil {
-		return fmt.Errorf("Unable to list routes: %v", err)
-	}
-
+	// Delete all the interface routes in the default routing table, which were
+	// copied to source based routing tables.
+	// Not deleting them while copying to accommodate for multiple ipCfgs from
+	// the same subnet. Else, (error for network is unreachable while adding gateway)
 	for _, route := range routes {
-		log.Printf("Moving route %s from table %d to %d",
-			route.String(), route.Table, table)
-
+		log.Printf("Deleting route %s from table %d", route.String(), route.Table)
 		err := netlink.RouteDel(&route)
 		if err != nil {
 			return fmt.Errorf("Failed to delete route: %v", err)
-		}
-
-		route.Table = table
-
-		// Reset the route flags since if it is dynamically created,
-		// adding it to the new table will fail with "invalid argument"
-		route.Flags = 0
-
-		// We use route replace in case the route already exists, which
-		// is possible for the default gateway we added above.
-		err = netlink.RouteReplace(&route)
-		if err != nil {
-			return fmt.Errorf("Failed to readd route: %v", err)
 		}
 	}
 
@@ -329,7 +349,6 @@ func cmdDel(args *skel.CmdArgs) error {
 
 // Tidy up the rules for the deleted interface
 func tidyRules(iface string) error {
-
 	// We keep on going on rule deletion error, but return the last failure.
 	var errReturn error
 
@@ -341,6 +360,13 @@ func tidyRules(iface string) error {
 
 	link, err := netlink.LinkByName(iface)
 	if err != nil {
+		// If interface is not found by any reason it's safe to ignore an error. Also, we don't need to raise an error
+		// during cmdDel call according to CNI spec:
+		// https://github.com/containernetworking/cni/blob/main/SPEC.md#del-remove-container-from-network-or-un-apply-modifications
+		_, notFound := err.(netlink.LinkNotFoundError)
+		if notFound {
+			return nil
+		}
 		log.Printf("Failed to get link %s: %v", iface, err)
 		return fmt.Errorf("Failed to get link %s: %v", iface, err)
 	}
@@ -379,6 +405,6 @@ func main() {
 	skel.PluginMain(cmdAdd, cmdCheck, cmdDel, version.All, bv.BuildString("sbr"))
 }
 
-func cmdCheck(args *skel.CmdArgs) error {
+func cmdCheck(_ *skel.CmdArgs) error {
 	return nil
 }

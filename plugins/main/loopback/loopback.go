@@ -24,9 +24,8 @@ import (
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
-	"github.com/containernetworking/cni/pkg/types/current"
+	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
-
 	"github.com/containernetworking/plugins/pkg/ns"
 	bv "github.com/containernetworking/plugins/pkg/utils/buildversion"
 )
@@ -109,12 +108,19 @@ func cmdAdd(args *skel.CmdArgs) error {
 		// loopback should pass it transparently
 		result = conf.PrevResult
 	} else {
-		loopbackInterface := &current.Interface{Name: args.IfName, Mac: "00:00:00:00:00:00", Sandbox: args.Netns}
-		r := &current.Result{CNIVersion: conf.CNIVersion, Interfaces: []*current.Interface{loopbackInterface}}
+		r := &current.Result{
+			CNIVersion: conf.CNIVersion,
+			Interfaces: []*current.Interface{
+				{
+					Name:    args.IfName,
+					Mac:     "00:00:00:00:00:00",
+					Sandbox: args.Netns,
+				},
+			},
+		}
 
 		if v4Addr != nil {
 			r.IPs = append(r.IPs, &current.IPConfig{
-				Version:   "4",
 				Interface: current.Int(0),
 				Address:   *v4Addr,
 			})
@@ -122,7 +128,6 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 		if v6Addr != nil {
 			r.IPs = append(r.IPs, &current.IPConfig{
-				Version:   "6",
 				Interface: current.Int(0),
 				Address:   *v6Addr,
 			})
@@ -153,7 +158,14 @@ func cmdDel(args *skel.CmdArgs) error {
 		return nil
 	})
 	if err != nil {
-		return err // not tested
+		//  if NetNs is passed down by the Cloud Orchestration Engine, or if it called multiple times
+		// so don't return an error if the device is already removed.
+		// https://github.com/kubernetes/kubernetes/issues/43014#issuecomment-287164444
+		_, ok := err.(ns.NSPathNotExistErr)
+		if ok {
+			return nil
+		}
+		return err
 	}
 
 	return nil

@@ -22,14 +22,12 @@ import (
 	"os"
 	"runtime"
 
-	"github.com/j-keck/arping"
 	"github.com/vishvananda/netlink"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
-	"github.com/containernetworking/cni/pkg/types/current"
+	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
-
 	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/containernetworking/plugins/pkg/ns"
@@ -66,7 +64,7 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, pr *current.Resu
 	containerInterface := &current.Interface{}
 
 	err := netns.Do(func(hostNS ns.NetNS) error {
-		hostVeth, contVeth0, err := ip.SetupVeth(ifName, mtu, hostNS)
+		hostVeth, contVeth0, err := ip.SetupVeth(ifName, mtu, "", hostNS)
 		if err != nil {
 			return err
 		}
@@ -83,13 +81,13 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, pr *current.Resu
 
 		pr.Interfaces = []*current.Interface{hostInterface, containerInterface}
 
-		if err = ipam.ConfigureIface(ifName, pr); err != nil {
-			return err
-		}
-
 		contVeth, err := net.InterfaceByName(ifName)
 		if err != nil {
 			return fmt.Errorf("failed to look up %q: %v", ifName, err)
+		}
+
+		if err = ipam.ConfigureIface(ifName, pr); err != nil {
+			return err
 		}
 
 		for _, ipc := range pr.IPs {
@@ -108,7 +106,7 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, pr *current.Resu
 			}
 
 			addrBits := 32
-			if ipc.Version == "6" {
+			if ipc.Address.IP.To4() == nil {
 				addrBits = 128
 			}
 
@@ -136,13 +134,6 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, pr *current.Resu
 				if err := netlink.RouteAdd(&r); err != nil {
 					return fmt.Errorf("failed to add route %v: %v", r, err)
 				}
-			}
-		}
-
-		// Send a gratuitous arp for all v4 addresses
-		for _, ipc := range pr.IPs {
-			if ipc.Version == "4" {
-				_ = arping.GratuitousArpOverIface(ipc.Address.IP, *contVeth)
 			}
 		}
 
@@ -290,8 +281,14 @@ func cmdDel(args *skel.CmdArgs) error {
 		}
 		return err
 	})
-
 	if err != nil {
+		//  if NetNs is passed down by the Cloud Orchestration Engine, or if it called multiple times
+		// so don't return an error if the device is already removed.
+		// https://github.com/kubernetes/kubernetes/issues/43014#issuecomment-287164444
+		_, ok := err.(ns.NSPathNotExistErr)
+		if ok {
+			return nil
+		}
 		return err
 	}
 
@@ -359,7 +356,6 @@ func cmdCheck(args *skel.CmdArgs) error {
 	//
 	// Check prevResults for ips, routes and dns against values found in the container
 	if err := netns.Do(func(_ ns.NetNS) error {
-
 		// Check interface against values found in the container
 		err := validateCniContainerInterface(contMap)
 		if err != nil {
@@ -384,7 +380,6 @@ func cmdCheck(args *skel.CmdArgs) error {
 }
 
 func validateCniContainerInterface(intf current.Interface) error {
-
 	var link netlink.Link
 	var err error
 
