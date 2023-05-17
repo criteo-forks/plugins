@@ -85,7 +85,6 @@ func (a *IPAllocator) Get(id string, ifname string, requestedIP net.IP) (*curren
 					return nil, err
 				}
 				return &current.IPConfig{
-					Version: "4",
 					Address: net.IPNet{
 						IP:   allocatedIP,
 						Mask: r.Subnet.Mask,
