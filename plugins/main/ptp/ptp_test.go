@@ -611,7 +611,9 @@ var _ = Describe("ptp Operations", func() {
 				}
 
 				ipv4, netIPv4, err := net.ParseCIDR(DUMMYIPV4)
+				Expect(err).NotTo(HaveOccurred())
 				ipv6, netIPv6, err := net.ParseCIDR(DUMMYIPV6)
+				Expect(err).NotTo(HaveOccurred())
 
 				for _, address := range []dummyAddresses{
 					{
