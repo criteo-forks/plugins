@@ -177,6 +177,18 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, routeSrcIntfIPv4
 	return hostInterface, containerInterface, nil
 }
 
+func removeLinkLocalAddresses(addrList []netlink.Addr) []netlink.Addr {
+	var res []netlink.Addr
+	for _, addr := range addrList {
+		// we removed link-local addresses
+		if addr.Scope != int(netlink.SCOPE_UNIVERSE) {
+			continue
+		}
+		res = append(res, addr)
+	}
+	return res
+}
+
 // getIntfIP returns the primary IP configured on the ifName interface for the given family.
 func getIntfIP(ifName string, family int) (net.IP, error) {
 	sourceIntf, err := netlink.LinkByName(ifName)
@@ -185,6 +197,7 @@ func getIntfIP(ifName string, family int) (net.IP, error) {
 	}
 
 	addrList, err := netlink.AddrList(sourceIntf, family)
+	addrList = removeLinkLocalAddresses(addrList)
 	if err != nil {
 		return nil, fmt.Errorf("cannot obtain list of IP addresses for %s: %v", sourceIntf.Attrs().Name, err)
 	}
