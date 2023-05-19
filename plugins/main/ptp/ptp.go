@@ -365,8 +365,12 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 
 	if conf.SysCtl != nil {
+		r, err := result.GetAsVersion(conf.CNIVersion)
+		if err != nil {
+			return fmt.Errorf("failed to get result as version %s", conf.CNIVersion)
+		}
 		// Result of the ptp plugin must be passed to the tuning plugin as a map
-		conf.RawPrevResult, err = convertResultToMap(result)
+		conf.RawPrevResult, err = convertResultToMap(r)
 		if err != nil {
 			return fmt.Errorf("failed to convert result to map: %w", err)
 		}
@@ -391,7 +395,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 }
 
 // convertResultToMap cast the Result struct as an interface by using json.Marshal/Unmarshal
-func convertResultToMap(r *current.Result) (map[string]interface{}, error) {
+func convertResultToMap(r types.Result) (map[string]interface{}, error) {
 	var prevResult map[string]interface{}
 	bytes, err := json.Marshal(r)
 	if err != nil {
