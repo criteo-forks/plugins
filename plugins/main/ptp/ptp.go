@@ -219,11 +219,14 @@ func replaceRouteSrcIP(linkIndex int, srcIP net.IP, routes []*types.Route) error
 		if (r.Dst.IP.To4() != nil) != isV4 {
 			continue
 		}
-		routeList, err := netlink.RouteListFiltered(family, &netlink.Route{
+		filter := &netlink.Route{
 			LinkIndex: linkIndex,
 			Dst:       &r.Dst,
-			Gw:        r.GW,
-		}, netlink.RT_FILTER_DST|netlink.RT_FILTER_GW)
+		}
+		if r.Dst.String() == "0.0.0.0/0" || r.Dst.String() == "::/0" {
+			filter.Dst = nil
+		}
+		routeList, err := netlink.RouteListFiltered(family, filter, netlink.RT_FILTER_DST)
 		if err != nil {
 			return fmt.Errorf("cannot obtain list of routes for link index %d: %v", linkIndex, err)
 		}
