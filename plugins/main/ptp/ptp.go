@@ -257,10 +257,10 @@ func setupHostVeth(netns string, vethName string, result *current.Result) error 
 	// move hostVeth in the target NetNS
 	if netns != "" {
 		destNetns, err = ns.GetNS(fmt.Sprintf("/var/run/netns/%s", netns))
-		defer destNetns.Close()
 		if err != nil {
 			return fmt.Errorf("failed to get netns %s", netns)
 		}
+		defer destNetns.Close()
 		if err := netlink.LinkSetNsFd(veth, int(destNetns.Fd())); err != nil {
 			return fmt.Errorf("failed to move host veth to target netns %s: %v", netns, err)
 		}
@@ -272,10 +272,10 @@ func setupHostVeth(netns string, vethName string, result *current.Result) error 
 		}
 	} else {
 		destNetns, err = ns.GetCurrentNS()
-		defer destNetns.Close()
 		if err != nil {
 			return fmt.Errorf("failed to get current netns")
 		}
+		defer destNetns.Close()
 	}
 
 	return destNetns.Do(func(hostNS ns.NetNS) error {
