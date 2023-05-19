@@ -511,7 +511,7 @@ func cmdCheck(args *skel.CmdArgs) error {
 		return err
 	}
 
-	var contMap current.Interface
+	var contMap, hostMap current.Interface
 	// Find interfaces for name whe know, that of host-device inside container
 	for _, intf := range result.Interfaces {
 		if args.IfName == intf.Name {
@@ -520,12 +520,31 @@ func cmdCheck(args *skel.CmdArgs) error {
 				continue
 			}
 		}
+		// we assume the other interface corresponds to the host's interface
+		hostMap = *intf
 	}
 
 	// The namespace must be the same as what was configured
 	if args.Netns != contMap.Sandbox {
 		return fmt.Errorf("Sandbox in prevResult %s doesn't match configured netns: %s",
 			contMap.Sandbox, args.Netns)
+	}
+
+	if conf.HostNetNS != "" {
+		hostNetns, err := ns.GetNS(fmt.Sprintf("/var/run/netns/%s", conf.HostNetNS))
+		if err != nil {
+			return fmt.Errorf("failed to open netns %q: %v", conf.HostNetNS, err)
+		}
+		defer hostNetns.Close()
+		if err := hostNetns.Do(func(_ ns.NetNS) error {
+			err := validateCniHostInterface(hostMap)
+			if err != nil {
+				return err
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
 	}
 
 	//
@@ -545,6 +564,20 @@ func cmdCheck(args *skel.CmdArgs) error {
 		err = ip.ValidateExpectedRoute(result.Routes)
 		if err != nil {
 			return err
+		}
+
+		if conf.RouteSourceInterfaceIPv4 != "" {
+			err = validateSourceIPRoute(conf.RouteSourceInterfaceIPv4, netlink.FAMILY_V4, result.Routes)
+			if err != nil {
+				return err
+			}
+		}
+
+		if conf.RouteSourceInterfaceIPv6 != "" {
+			err = validateSourceIPRoute(conf.RouteSourceInterfaceIPv6, netlink.FAMILY_V6, result.Routes)
+			if err != nil {
+				return err
+			}
 		}
 		return nil
 	}); err != nil {
@@ -577,6 +610,69 @@ func validateCniContainerInterface(intf current.Interface) error {
 	if intf.Mac != "" {
 		if intf.Mac != link.Attrs().HardwareAddr.String() {
 			return fmt.Errorf("ptp: Interface %s Mac %s doesn't match container Mac: %s", intf.Name, intf.Mac, link.Attrs().HardwareAddr)
+		}
+	}
+
+	return nil
+}
+
+func validateCniHostInterface(intf current.Interface) error {
+	link, err := netlink.LinkByName(intf.Name)
+	if err != nil {
+		return fmt.Errorf("ptp: Host Interface name in prevResult: %s not found", intf.Name)
+	}
+	_, isVeth := link.(*netlink.Veth)
+	if !isVeth {
+		return fmt.Errorf("Error: Host interface %s not of type veth/p2p", link.Attrs().Name)
+	}
+	return nil
+}
+
+func validateSourceIPRoute(ifaceSrcIP string, family int, resultRoutes []*types.Route) error {
+	srcIP, err := getIntfIP(ifaceSrcIP, family)
+	if err != nil {
+		return err
+	}
+
+	var filteredRoutes []*types.Route
+
+	for _, route := range resultRoutes {
+		if family == netlink.FAMILY_V4 && route.Dst.IP.To4() != nil || family == netlink.FAMILY_V6 && route.Dst.IP.To16() != nil {
+			filteredRoutes = append(filteredRoutes, route)
+		}
+	}
+
+	// Ensure that each static route has the correct source IP
+	for _, route := range filteredRoutes {
+		find := &netlink.Route{Dst: &route.Dst, Gw: route.GW, Src: srcIP}
+		routeFilter := netlink.RT_FILTER_DST | netlink.RT_FILTER_SRC
+		if route.GW != nil {
+			routeFilter |= netlink.RT_FILTER_GW
+		}
+
+		switch {
+		case route.Dst.IP.To4() != nil:
+			family = netlink.FAMILY_V4
+			// Default route needs Dst set to nil
+			if route.Dst.String() == "0.0.0.0/0" {
+				find = &netlink.Route{Dst: nil, Gw: route.GW, Src: srcIP}
+			}
+		case len(route.Dst.IP) == net.IPv6len:
+			family = netlink.FAMILY_V6
+			// Default route needs Dst set to nil
+			if route.Dst.String() == "::/0" {
+				find = &netlink.Route{Dst: nil, Gw: route.GW, Src: srcIP}
+			}
+		default:
+			return fmt.Errorf("Invalid static route found %v", route)
+		}
+
+		wasFound, err := netlink.RouteListFiltered(family, find, routeFilter)
+		if err != nil {
+			return fmt.Errorf("Expected Route %v not route table lookup error %v", route, err)
+		}
+		if wasFound == nil {
+			return fmt.Errorf("Expected Route %v not found in routing table", route)
 		}
 	}
 
