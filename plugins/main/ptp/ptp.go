@@ -170,7 +170,6 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, routeSrcIntfIPv4
 		}
 		return nil
 	})
-
 	if err != nil {
 		return nil, nil, err
 	}
