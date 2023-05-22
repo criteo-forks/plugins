@@ -539,7 +539,7 @@ var _ = Describe("ptp Operations", func() {
 			Expect(err).NotTo(HaveOccurred())
 		})
 
-		It(fmt.Sprintf("[%s] configures and deconfigures a CNI dual-stack ptp link + Criteo options with ADD/DEL", ver), func() {
+		It(fmt.Sprintf("[%s] configures and deconfigures a CNI dual-stack ptp link + custom options with ADD/DEL", ver), func() {
 			const SRCIFNAME = "dummy0"
 			const DUMMYIPV4 = "10.2.3.1/24"
 			const DUMMYIPV6 = "2001:db8:2::1/64"
