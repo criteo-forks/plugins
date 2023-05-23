@@ -15,7 +15,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,7 +24,6 @@ import (
 
 	"github.com/vishvananda/netlink"
 
-	"github.com/containernetworking/cni/pkg/invoke"
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
 	current "github.com/containernetworking/cni/pkg/types/100"
@@ -46,12 +44,11 @@ func init() {
 
 type NetConf struct {
 	types.NetConf
-	IPMasq                   bool              `json:"ipMasq"`
-	MTU                      int               `json:"mtu"`
-	HostNetNS                string            `json:"host_netns"`
-	RouteSourceInterfaceIPv4 string            `json:"route_source_interface_ipv4"`
-	RouteSourceInterfaceIPv6 string            `json:"route_source_interface_ipv6"`
-	SysCtl                   map[string]string `json:"sysctl"`
+	IPMasq                   bool   `json:"ipMasq"`
+	MTU                      int    `json:"mtu"`
+	HostNetNS                string `json:"host_netns"`
+	RouteSourceInterfaceIPv4 string `json:"route_source_interface_ipv4"`
+	RouteSourceInterfaceIPv6 string `json:"route_source_interface_ipv6"`
 }
 
 func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, routeSrcIntfIPv4 string, routeSrcIntfIPv6 string, pr *current.Result) (*current.Interface, *current.Interface, error) {
@@ -379,47 +376,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		result.DNS = conf.DNS
 	}
 
-	if conf.SysCtl != nil {
-		r, err := result.GetAsVersion(conf.CNIVersion)
-		if err != nil {
-			return fmt.Errorf("failed to get result as version %s", conf.CNIVersion)
-		}
-		// Result of the ptp plugin must be passed to the tuning plugin as a map
-		conf.RawPrevResult, err = convertResultToMap(r)
-		if err != nil {
-			return fmt.Errorf("failed to convert result to map: %w", err)
-		}
-
-		confJSON, err := json.MarshalIndent(conf, "", "    ")
-		if err != nil {
-			return fmt.Errorf("failed to JSON encode: %w", err)
-		}
-
-		r, err = invoke.DelegateAdd(context.TODO(), "tuning", confJSON, nil)
-		if err != nil {
-			return fmt.Errorf("failed to invoke tuning plugin: %w", err)
-		}
-		// Convert the tuning result into the current Result type
-		result, err = current.NewResultFromResult(r)
-		if err != nil {
-			return err
-		}
-	}
-
 	return types.PrintResult(result, conf.CNIVersion)
-}
-
-// convertResultToMap cast the Result struct as an interface by using json.Marshal/Unmarshal
-func convertResultToMap(r types.Result) (map[string]interface{}, error) {
-	var prevResult map[string]interface{}
-	bytes, err := json.Marshal(r)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal data %w", err)
-	}
-	if err = json.Unmarshal(bytes, &prevResult); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal data %w", err)
-	}
-	return prevResult, nil
 }
 
 func dnsConfSet(dnsConf types.DNS) bool {

@@ -582,9 +582,6 @@ var _ = Describe("ptp Operations", func() {
 							"dst": "172.16.0.0/12"
 						}
 					]
-				},
-				"sysctl": {
-					"net.ipv4.conf.IFNAME.rp_filter": "2"
 				}
 			}`, ver, hostNsName, SRCIFNAME)
 
