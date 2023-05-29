@@ -44,11 +44,14 @@ func init() {
 
 type NetConf struct {
 	types.NetConf
-	IPMasq bool `json:"ipMasq"`
-	MTU    int  `json:"mtu"`
+	IPMasq                   bool   `json:"ipMasq"`
+	MTU                      int    `json:"mtu"`
+	HostNetNS                string `json:"host_netns"`
+	RouteSourceInterfaceIPv4 string `json:"route_source_interface_ipv4"`
+	RouteSourceInterfaceIPv6 string `json:"route_source_interface_ipv6"`
 }
 
-func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, pr *current.Result) (*current.Interface, *current.Interface, error) {
+func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, routeSrcIntfIPv4 string, routeSrcIntfIPv6 string, pr *current.Result) (*current.Interface, *current.Interface, error) {
 	// The IPAM result will be something like IP=192.168.3.5/24, GW=192.168.3.1.
 	// What we want is really a point-to-point link but veth does not support IFF_POINTTOPOINT.
 	// Next best thing would be to let it ARP but set interface to 192.168.3.5/32 and
@@ -88,6 +91,20 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, pr *current.Resu
 
 		if err = ipam.ConfigureIface(ifName, pr); err != nil {
 			return err
+		}
+
+		var srcIPv4, srcIPv6 net.IP
+		if routeSrcIntfIPv4 != "" {
+			srcIPv4, err = getIntfIP(routeSrcIntfIPv4, netlink.FAMILY_V4)
+			if err != nil {
+				return err
+			}
+		}
+		if routeSrcIntfIPv6 != "" {
+			srcIPv6, err = getIntfIP(routeSrcIntfIPv6, netlink.FAMILY_V6)
+			if err != nil {
+				return err
+			}
 		}
 
 		for _, ipc := range pr.IPs {
@@ -137,6 +154,17 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, pr *current.Resu
 			}
 		}
 
+		if srcIPv4 != nil {
+			if err := replaceRouteSrcIP(contVeth.Index, srcIPv4, pr.Routes); err != nil {
+				return err
+			}
+		}
+
+		if srcIPv6 != nil {
+			if err := replaceRouteSrcIP(contVeth.Index, srcIPv6, pr.Routes); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -145,39 +173,135 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, pr *current.Resu
 	return hostInterface, containerInterface, nil
 }
 
-func setupHostVeth(vethName string, result *current.Result) error {
-	// hostVeth moved namespaces and may have a new ifindex
+func removeLinkLocalAddresses(addrList []netlink.Addr) []netlink.Addr {
+	var res []netlink.Addr
+	for _, addr := range addrList {
+		// we removed link-local addresses
+		if addr.Scope != int(netlink.SCOPE_UNIVERSE) {
+			continue
+		}
+		res = append(res, addr)
+	}
+	return res
+}
+
+// getIntfIP returns the primary IP configured on the ifName interface for the given family.
+func getIntfIP(ifName string, family int) (net.IP, error) {
+	sourceIntf, err := netlink.LinkByName(ifName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to lookup %q: %v", ifName, err)
+	}
+
+	addrList, err := netlink.AddrList(sourceIntf, family)
+	addrList = removeLinkLocalAddresses(addrList)
+	if err != nil {
+		return nil, fmt.Errorf("cannot obtain list of IP addresses for %s: %v", sourceIntf.Attrs().Name, err)
+	}
+	if len(addrList) != 1 {
+		return nil, fmt.Errorf("no address or more than one address configured on interface %s", sourceIntf.Attrs().Name)
+	}
+
+	return addrList[0].IP, nil
+}
+
+// replaceRouteSrcIP replaces the source IP used for the routes attached to a link.
+func replaceRouteSrcIP(linkIndex int, srcIP net.IP, routes []*types.Route) error {
+	family := netlink.FAMILY_V4
+	isV4 := srcIP.To4() != nil
+	if !isV4 {
+		family = netlink.FAMILY_V6
+	}
+	for _, r := range routes {
+		if (r.Dst.IP.To4() != nil) != isV4 {
+			continue
+		}
+		filter := &netlink.Route{
+			LinkIndex: linkIndex,
+			Dst:       &r.Dst,
+		}
+		if r.Dst.String() == "0.0.0.0/0" || r.Dst.String() == "::/0" {
+			filter.Dst = nil
+		}
+		routeList, err := netlink.RouteListFiltered(family, filter, netlink.RT_FILTER_DST)
+		if err != nil {
+			return fmt.Errorf("cannot obtain list of routes for link index %d: %v", linkIndex, err)
+		}
+		if len(routeList) > 1 {
+			return fmt.Errorf("%d routes found for %s", len(routeList), r.Dst.String())
+		} else if len(routeList) == 0 {
+			return fmt.Errorf("no route found for %s", r.Dst.String())
+		}
+		newRoute := routeList[0]
+		newRoute.Src = srcIP
+		if err := netlink.RouteReplace(&newRoute); err != nil {
+			return fmt.Errorf("failed to replace route: %v", err)
+		}
+	}
+	return nil
+}
+
+// setupHostVeth configure the veth interface on the host side, optionally moving it
+// to a different netns than the one used to invoke the script.
+func setupHostVeth(netns string, vethName string, result *current.Result) error {
+	// vethName moved to another namespace and may have a new ifindex
 	veth, err := netlink.LinkByName(vethName)
 	if err != nil {
 		return fmt.Errorf("failed to lookup %q: %v", vethName, err)
 	}
 
-	for _, ipc := range result.IPs {
-		maskLen := 128
-		if ipc.Address.IP.To4() != nil {
-			maskLen = 32
+	var destNetns ns.NetNS
+	// move hostVeth in the target NetNS
+	if netns != "" {
+		destNetns, err = ns.GetNS(fmt.Sprintf("/var/run/netns/%s", netns))
+		if err != nil {
+			return fmt.Errorf("failed to get netns %s", netns)
 		}
-
-		ipn := &net.IPNet{
-			IP:   ipc.Gateway,
-			Mask: net.CIDRMask(maskLen, maskLen),
+		defer destNetns.Close()
+		if err := netlink.LinkSetNsFd(veth, int(destNetns.Fd())); err != nil {
+			return fmt.Errorf("failed to move host veth to target netns %s: %v", netns, err)
 		}
-		addr := &netlink.Addr{IPNet: ipn, Label: ""}
-		if err = netlink.AddrAdd(veth, addr); err != nil {
-			return fmt.Errorf("failed to add IP addr (%#v) to veth: %v", ipn, err)
+		err = destNetns.Do(func(hostNS ns.NetNS) error {
+			return netlink.LinkSetUp(veth)
+		})
+		if err != nil {
+			return fmt.Errorf("failed to set up veth in target netns %s: %v", netns, err)
 		}
-
-		ipn = &net.IPNet{
-			IP:   ipc.Address.IP,
-			Mask: net.CIDRMask(maskLen, maskLen),
+	} else {
+		destNetns, err = ns.GetCurrentNS()
+		if err != nil {
+			return fmt.Errorf("failed to get current netns")
 		}
-		// dst happens to be the same as IP/net of host veth
-		if err = ip.AddHostRoute(ipn, nil, veth); err != nil && !os.IsExist(err) {
-			return fmt.Errorf("failed to add route on host: %v", err)
-		}
+		defer destNetns.Close()
 	}
 
-	return nil
+	return destNetns.Do(func(hostNS ns.NetNS) error {
+		for _, ipc := range result.IPs {
+			maskLen := 128
+			if ipc.Address.IP.To4() != nil {
+				maskLen = 32
+			}
+
+			ipn := &net.IPNet{
+				IP:   ipc.Gateway,
+				Mask: net.CIDRMask(maskLen, maskLen),
+			}
+			addr := &netlink.Addr{IPNet: ipn, Label: ""}
+			if err = netlink.AddrAdd(veth, addr); err != nil {
+				return fmt.Errorf("failed to add IP addr (%#v) to veth: %v", ipn, err)
+			}
+
+			ipn = &net.IPNet{
+				IP:   ipc.Address.IP,
+				Mask: net.CIDRMask(maskLen, maskLen),
+			}
+			// dst happens to be the same as IP/net of host veth
+			if err = ip.AddHostRoute(ipn, nil, veth); err != nil && !os.IsExist(err) {
+				return fmt.Errorf("failed to add route on host: %v", err)
+			}
+		}
+
+		return nil
+	})
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
@@ -213,18 +337,25 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("Could not enable IP forwarding: %v", err)
 	}
 
-	netns, err := ns.GetNS(args.Netns)
+	contNetns, err := ns.GetNS(args.Netns)
 	if err != nil {
-		return fmt.Errorf("failed to open netns %q: %v", args.Netns, err)
+		return fmt.Errorf("failed to open container netns %q: %v", args.Netns, err)
 	}
-	defer netns.Close()
+	defer contNetns.Close()
 
-	hostInterface, _, err := setupContainerVeth(netns, args.IfName, conf.MTU, result)
+	hostInterface, _, err := setupContainerVeth(
+		contNetns,
+		args.IfName,
+		conf.MTU,
+		conf.RouteSourceInterfaceIPv4,
+		conf.RouteSourceInterfaceIPv6,
+		result,
+	)
 	if err != nil {
 		return err
 	}
 
-	if err = setupHostVeth(hostInterface.Name, result); err != nil {
+	if err = setupHostVeth(conf.HostNetNS, hostInterface.Name, result); err != nil {
 		return err
 	}
 
@@ -336,7 +467,7 @@ func cmdCheck(args *skel.CmdArgs) error {
 		return err
 	}
 
-	var contMap current.Interface
+	var contMap, hostMap current.Interface
 	// Find interfaces for name whe know, that of host-device inside container
 	for _, intf := range result.Interfaces {
 		if args.IfName == intf.Name {
@@ -345,12 +476,31 @@ func cmdCheck(args *skel.CmdArgs) error {
 				continue
 			}
 		}
+		// we assume the other interface corresponds to the host's interface
+		hostMap = *intf
 	}
 
 	// The namespace must be the same as what was configured
 	if args.Netns != contMap.Sandbox {
 		return fmt.Errorf("Sandbox in prevResult %s doesn't match configured netns: %s",
 			contMap.Sandbox, args.Netns)
+	}
+
+	if conf.HostNetNS != "" {
+		hostNetns, err := ns.GetNS(fmt.Sprintf("/var/run/netns/%s", conf.HostNetNS))
+		if err != nil {
+			return fmt.Errorf("failed to open netns %q: %v", conf.HostNetNS, err)
+		}
+		defer hostNetns.Close()
+		if err := hostNetns.Do(func(_ ns.NetNS) error {
+			err := validateCniHostInterface(hostMap)
+			if err != nil {
+				return err
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
 	}
 
 	//
@@ -370,6 +520,20 @@ func cmdCheck(args *skel.CmdArgs) error {
 		err = ip.ValidateExpectedRoute(result.Routes)
 		if err != nil {
 			return err
+		}
+
+		if conf.RouteSourceInterfaceIPv4 != "" {
+			err = validateSourceIPRoute(conf.RouteSourceInterfaceIPv4, netlink.FAMILY_V4, result.Routes)
+			if err != nil {
+				return err
+			}
+		}
+
+		if conf.RouteSourceInterfaceIPv6 != "" {
+			err = validateSourceIPRoute(conf.RouteSourceInterfaceIPv6, netlink.FAMILY_V6, result.Routes)
+			if err != nil {
+				return err
+			}
 		}
 		return nil
 	}); err != nil {
@@ -402,6 +566,69 @@ func validateCniContainerInterface(intf current.Interface) error {
 	if intf.Mac != "" {
 		if intf.Mac != link.Attrs().HardwareAddr.String() {
 			return fmt.Errorf("ptp: Interface %s Mac %s doesn't match container Mac: %s", intf.Name, intf.Mac, link.Attrs().HardwareAddr)
+		}
+	}
+
+	return nil
+}
+
+func validateCniHostInterface(intf current.Interface) error {
+	link, err := netlink.LinkByName(intf.Name)
+	if err != nil {
+		return fmt.Errorf("ptp: Host Interface name in prevResult: %s not found", intf.Name)
+	}
+	_, isVeth := link.(*netlink.Veth)
+	if !isVeth {
+		return fmt.Errorf("Error: Host interface %s not of type veth/p2p", link.Attrs().Name)
+	}
+	return nil
+}
+
+func validateSourceIPRoute(ifaceSrcIP string, family int, resultRoutes []*types.Route) error {
+	srcIP, err := getIntfIP(ifaceSrcIP, family)
+	if err != nil {
+		return err
+	}
+
+	var filteredRoutes []*types.Route
+
+	for _, route := range resultRoutes {
+		if family == netlink.FAMILY_V4 && route.Dst.IP.To4() != nil || family == netlink.FAMILY_V6 && route.Dst.IP.To16() != nil {
+			filteredRoutes = append(filteredRoutes, route)
+		}
+	}
+
+	// Ensure that each static route has the correct source IP
+	for _, route := range filteredRoutes {
+		find := &netlink.Route{Dst: &route.Dst, Gw: route.GW, Src: srcIP}
+		routeFilter := netlink.RT_FILTER_DST | netlink.RT_FILTER_SRC
+		if route.GW != nil {
+			routeFilter |= netlink.RT_FILTER_GW
+		}
+
+		switch {
+		case route.Dst.IP.To4() != nil:
+			family = netlink.FAMILY_V4
+			// Default route needs Dst set to nil
+			if route.Dst.String() == "0.0.0.0/0" {
+				find = &netlink.Route{Dst: nil, Gw: route.GW, Src: srcIP}
+			}
+		case len(route.Dst.IP) == net.IPv6len:
+			family = netlink.FAMILY_V6
+			// Default route needs Dst set to nil
+			if route.Dst.String() == "::/0" {
+				find = &netlink.Route{Dst: nil, Gw: route.GW, Src: srcIP}
+			}
+		default:
+			return fmt.Errorf("Invalid static route found %v", route)
+		}
+
+		wasFound, err := netlink.RouteListFiltered(family, find, routeFilter)
+		if err != nil {
+			return fmt.Errorf("Expected Route %v not route table lookup error %v", route, err)
+		}
+		if wasFound == nil {
+			return fmt.Errorf("Expected Route %v not found in routing table", route)
 		}
 	}
 

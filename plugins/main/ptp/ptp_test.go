@@ -17,7 +17,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
+	"path"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -535,6 +537,103 @@ var _ = Describe("ptp Operations", func() {
 				return nil
 			})
 			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It(fmt.Sprintf("[%s] configures and deconfigures a CNI dual-stack ptp link + custom options with ADD/DEL", ver), func() {
+			const SRCIFNAME = "dummy0"
+			const DUMMYIPV4 = "10.2.3.1/24"
+			const DUMMYIPV6 = "2001:db8:2::1/64"
+
+			hostNS, err := testutils.NewNS()
+			Expect(err).NotTo(HaveOccurred())
+			defer func() {
+				Expect(hostNS.Close()).To(Succeed())
+				Expect(testutils.UnmountNS(hostNS)).To(Succeed())
+			}()
+
+			_, hostNsName := path.Split(hostNS.Path())
+
+			conf := fmt.Sprintf(`{
+				"cniVersion": "%s",
+				"name": "mynet",
+				"type": "ptp",
+				"ipMasq": false,
+				"mtu": 5000,
+				"host_netns": "%s",
+				"route_source_interface_ipv4": "%[3]s",
+				"route_source_interface_ipv6": "%[3]s",
+				"ipam": {
+					"type": "host-local",
+					"ranges": [
+						[{ "subnet": "10.1.2.0/24"}],
+						[{ "subnet": "2001:db8:1::0/66"}]
+					],
+					"routes": [
+						{
+							"dst": "0.0.0.0/0"
+						},
+						{
+							"dst": "::/0"
+						},
+						{
+							"dst": "10.0.0.0/8"
+						},
+						{
+							"dst": "172.16.0.0/12"
+						}
+					]
+				}
+			}`, ver, hostNsName, SRCIFNAME)
+
+			// Add a dummy interface in container netns with IPv4/IPv6
+			// to test the route_source_interface option
+			err = targetNS.Do(func(ns.NetNS) error {
+				defer GinkgoRecover()
+				err := netlink.LinkAdd(&netlink.Dummy{
+					LinkAttrs: netlink.LinkAttrs{
+						Name: SRCIFNAME,
+					},
+				})
+				Expect(err).NotTo(HaveOccurred())
+
+				link, err := netlink.LinkByName(SRCIFNAME)
+				Expect(err).NotTo(HaveOccurred())
+
+				err = netlink.LinkSetUp(link)
+				Expect(err).NotTo(HaveOccurred())
+
+				type dummyAddresses struct {
+					ip  net.IP
+					net *net.IPNet
+				}
+
+				ipv4, netIPv4, err := net.ParseCIDR(DUMMYIPV4)
+				Expect(err).NotTo(HaveOccurred())
+				ipv6, netIPv6, err := net.ParseCIDR(DUMMYIPV6)
+				Expect(err).NotTo(HaveOccurred())
+
+				for _, address := range []dummyAddresses{
+					{
+						ip:  ipv4,
+						net: netIPv4,
+					},
+					{
+						ip:  ipv6,
+						net: netIPv6,
+					},
+				} {
+					err := netlink.AddrAdd(link, &netlink.Addr{
+						IPNet: &net.IPNet{
+							IP:   address.ip,
+							Mask: address.net.Mask,
+						},
+					})
+					Expect(err).NotTo(HaveOccurred())
+				}
+				return nil
+			})
+			Expect(err).NotTo(HaveOccurred())
+			doTest(conf, ver, 2, types.DNS{}, targetNS)
 		})
 	}
 })
