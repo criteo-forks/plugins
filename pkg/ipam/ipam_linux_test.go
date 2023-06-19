@@ -292,4 +292,60 @@ var _ = Describe("ConfigureIface", func() {
 		})
 		Expect(err).NotTo(HaveOccurred())
 	})
+	It("configures a link with addresses, routes and metrics", func() {
+		result.Routes[0].Metric = 100
+		result.Routes[1].Metric = 10
+		err := originalNS.Do(func(ns.NetNS) error {
+			defer GinkgoRecover()
+
+			err := ConfigureIface(LINK_NAME, result)
+			Expect(err).NotTo(HaveOccurred())
+
+			link, err := netlink.LinkByName(LINK_NAME)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(link.Attrs().Name).To(Equal(LINK_NAME))
+
+			v4addrs, err := netlink.AddrList(link, syscall.AF_INET)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(v4addrs).To(HaveLen(1))
+			Expect(ipNetEqual(v4addrs[0].IPNet, ipv4)).To(BeTrue())
+
+			v6addrs, err := netlink.AddrList(link, syscall.AF_INET6)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(v6addrs).To(HaveLen(2))
+
+			var found bool
+			for _, a := range v6addrs {
+				if ipNetEqual(a.IPNet, ipv6) {
+					found = true
+					break
+				}
+			}
+			Expect(found).To(BeTrue())
+
+			// Ensure the v4 route, v6 route, and subnet route
+			routes, err := netlink.RouteList(link, 0)
+			Expect(err).NotTo(HaveOccurred())
+
+			var v4found, v6found bool
+			for _, route := range routes {
+				isv4 := route.Dst.IP.To4() != nil
+				if isv4 && ipNetEqual(route.Dst, routev4) && route.Gw.Equal(routegwv4) && route.Priority == result.Routes[0].Metric {
+					v4found = true
+				}
+				if !isv4 && ipNetEqual(route.Dst, routev6) && route.Gw.Equal(routegwv6) && route.Priority == result.Routes[1].Metric {
+					v6found = true
+				}
+
+				if v4found && v6found {
+					break
+				}
+			}
+			Expect(v4found).To(BeTrue())
+			Expect(v6found).To(BeTrue())
+
+			return nil
+		})
+		Expect(err).NotTo(HaveOccurred())
+	})
 })
