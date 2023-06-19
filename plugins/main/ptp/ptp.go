@@ -123,7 +123,9 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, routeSrcIntfIPv4
 			}
 
 			addrBits := 32
+			isv4 := true
 			if ipc.Address.IP.To4() == nil {
+				isv4 = false
 				addrBits = 128
 			}
 
@@ -152,19 +154,19 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, routeSrcIntfIPv4
 					return fmt.Errorf("failed to add route %v: %v", r, err)
 				}
 			}
-		}
+			if isv4 && srcIPv4 != nil {
+				if err := replaceRouteSrcIP(contVeth.Index, ipc.Gateway, srcIPv4, pr.Routes); err != nil {
+					return err
+				}
+			}
 
-		if srcIPv4 != nil {
-			if err := replaceRouteSrcIP(contVeth.Index, srcIPv4, pr.Routes); err != nil {
-				return err
+			if !isv4 && srcIPv6 != nil {
+				if err := replaceRouteSrcIP(contVeth.Index, ipc.Gateway, srcIPv6, pr.Routes); err != nil {
+					return err
+				}
 			}
 		}
 
-		if srcIPv6 != nil {
-			if err := replaceRouteSrcIP(contVeth.Index, srcIPv6, pr.Routes); err != nil {
-				return err
-			}
-		}
 		return nil
 	})
 	if err != nil {
@@ -205,7 +207,7 @@ func getIntfIP(ifName string, family int) (net.IP, error) {
 }
 
 // replaceRouteSrcIP replaces the source IP used for the routes attached to a link.
-func replaceRouteSrcIP(linkIndex int, srcIP net.IP, routes []*types.Route) error {
+func replaceRouteSrcIP(linkIndex int, defaultGw net.IP, srcIP net.IP, routes []*types.Route) error {
 	family := netlink.FAMILY_V4
 	isV4 := srcIP.To4() != nil
 	if !isV4 {
@@ -218,11 +220,19 @@ func replaceRouteSrcIP(linkIndex int, srcIP net.IP, routes []*types.Route) error
 		filter := &netlink.Route{
 			LinkIndex: linkIndex,
 			Dst:       &r.Dst,
+			Gw:        r.GW,
+		}
+		if r.GW == nil {
+			filter.Gw = defaultGw
 		}
 		if r.Dst.String() == "0.0.0.0/0" || r.Dst.String() == "::/0" {
 			filter.Dst = nil
 		}
-		routeList, err := netlink.RouteListFiltered(family, filter, netlink.RT_FILTER_DST)
+		routeList, err := netlink.RouteListFiltered(
+			family,
+			filter,
+			netlink.RT_FILTER_DST|netlink.RT_FILTER_OIF|netlink.RT_FILTER_GW,
+		)
 		if err != nil {
 			return fmt.Errorf("cannot obtain list of routes for link index %d: %v", linkIndex, err)
 		}
