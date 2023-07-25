@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"time"
 
 	"github.com/vishvananda/netlink"
 
@@ -33,6 +34,11 @@ import (
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/containernetworking/plugins/pkg/utils"
 	bv "github.com/containernetworking/plugins/pkg/utils/buildversion"
+)
+
+const (
+	RetryInterval   = time.Second
+	RetryMaxAttemps = 10
 )
 
 func init() {
@@ -187,20 +193,38 @@ func removeLinkLocalAddresses(addrList []netlink.Addr) []netlink.Addr {
 
 // getIntfIP returns the primary IP configured on the ifName interface for the given family.
 func getIntfIP(ifName string, family int) (net.IP, error) {
-	sourceIntf, err := netlink.LinkByName(ifName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to lookup %q: %v", ifName, err)
+	var sourceIntf netlink.Link
+	var addrList []netlink.Addr
+	var err error
+
+	// retry the address lookup if it fails (interface could be missing or not yet configured)
+	for i := 0; i < RetryMaxAttemps; i++ {
+		err := func() error {
+			sourceIntf, err = netlink.LinkByName(ifName)
+			if err != nil {
+				return fmt.Errorf("failed to lookup %q: %v", ifName, err)
+			}
+
+			addrList, err = netlink.AddrList(sourceIntf, family)
+			if err != nil {
+				return fmt.Errorf("cannot obtain list of IP addresses for %s: %v", sourceIntf.Attrs().Name, err)
+			}
+			addrList = removeLinkLocalAddresses(addrList)
+			if len(addrList) != 1 {
+				return fmt.Errorf("no address or more than one address configured on interface %s", sourceIntf.Attrs().Name)
+			}
+			return nil
+		}()
+
+		if err == nil {
+			break
+		}
+		time.Sleep(RetryInterval)
 	}
 
-	addrList, err := netlink.AddrList(sourceIntf, family)
-	addrList = removeLinkLocalAddresses(addrList)
 	if err != nil {
-		return nil, fmt.Errorf("cannot obtain list of IP addresses for %s: %v", sourceIntf.Attrs().Name, err)
+		return nil, err
 	}
-	if len(addrList) != 1 {
-		return nil, fmt.Errorf("no address or more than one address configured on interface %s", sourceIntf.Attrs().Name)
-	}
-
 	return addrList[0].IP, nil
 }
 
